@@ -1,0 +1,290 @@
+#define       F_CPU                  16000000UL
+
+//BIBLIOTECAS
+#include      <avr/io.h>
+#include      <stdio.h>
+#include      <math.h>
+#include      <util/delay.h>
+#include      <avr/interrupt.h>
+
+//I/0
+//ENTRADA
+#define       Emergencia             (!(PIND&(1<<PORTD3)))
+#define       S_Capacitivo           (!(PIND&(1<<PORTD4)))
+#define       S_Indutivo             (!(PIND&(1<<PORTD5)))
+#define       FC_Rancao              (!(PIND&(1<<PORTD6)))
+#define       Reset                  (!(PIND&(1<<PORTD7)))
+
+//SAÍDA
+#define       ON_Led_Reset           PORTB &=~ (1<<PORTB4)
+#define       OFF_Led_Reset          PORTB |= (1<<PORTB4)
+#define       ON_Led_OK              PORTB |= (1<<PORTB5)
+#define       OFF_Led_OK             PORTB &=~ (1<<PORTB5)
+#define       ON_Motor_Alimetador    PORTB &=~ (1<<PORTB3)
+#define       OFF_Motor_Alimetador   PORTB |= (1<<PORTB3)
+#define       ON_Ponte_H             PORTB |= (1<<PORTB1)
+#define       OFF_Ponte_H            PORTB &=~ (1<<PORTB1)
+#define       ON_Ponte_ANT_H         PORTB |= (1<<PORTB0)
+#define       OFF_Ponte_ANT_H        PORTB &=~ (1<<PORTB0)
+
+//VARIAVEIS
+uint8_t       PWM                    = 0;
+double        P1                     = 0.06329;
+double        P2                     = 8.082;
+uint16_t      Leitura_Potenciometro  = 0;
+char          out_str[100]           = {0};
+uint16_t      Posicao_Atual          = 0;  
+bool          Resetado               = 1; 
+uint8_t       Status_Sist_Racao      = 0; 
+uint8_t       Ativar_Controle        = 0;
+double        Referencia_Medida      = 0;
+double        Referencia_Despejo     = 0;
+
+//VARIÁVEIS DO CONTROLADOR
+double		  u						 = 0;
+double		  u_ant  				 = 0;
+double		  refe					 = 0;
+double		  erro                   = 0;
+double		  erro_ant               = 0;
+double		  P                      = 1;
+double		  KC                     = 5.478; //9.478
+double		  aKc                    = 2.3;   //9.3
+
+//FUNÇÕES COMUNICAÇÃO SERIAL
+char uart_write(char data);
+void uart_string(char* str);
+char uart_write(char data)
+{
+	while(!(UCSR0A &(1<<UDRE0)));
+	UDR0 = data;
+}
+void uart_string(char* str)
+{
+	while (*str)
+	{
+		uart_write(*str++);
+	}
+}
+
+//FUNÇÃO PARA LER A ACD
+uint16_t Analog_Read (uint8_t channel)
+{
+	ADMUX &= 0b11110000;                                                                                    //LIMPA CONFIGURAÇÃO DO CANAL ANTERIOR
+	ADMUX |= channel;                                                                                       //CONFIGURA O CANAL
+	ADCSRA |= (1<<ADSC);                                                                                    //INICIA CONVERSÃO DO AD
+	while(ADCSRA&(1<<ADSC));                                                                                //AGUARDA CONVERSÃO FICAR PRONTA
+	return ADC;
+}
+
+//FUNÇÃO PARA CONVERÇÃO MM PARA OHM
+uint16_t Conversao_mm_ohm(uint16_t POCICAO)
+{
+	uint16_t Convert_mm_ohm = 0;
+	Convert_mm_ohm = ((POCICAO-P2)/P1);
+	return Convert_mm_ohm;
+}
+
+//FUNÇÃO PARA CONVERÇÃO OHM PARA MM
+uint16_t Conversao_ohm_mm(uint16_t RESISTENCIA)
+{
+	uint16_t Convert_ohm_mm = 0;
+	
+	Convert_ohm_mm = ((RESISTENCIA*P1)+P2);
+	return Convert_ohm_mm;
+}
+
+//FUNÇÃO PARA PONTE H GIRAR PARA O SENTIDO HORARIO
+void Subir_Ponte_H(uint8_t PWM1)
+{
+	OFF_Ponte_H;
+	ON_Ponte_ANT_H;
+	OCR1B = PWM1;
+}
+
+//FUNÇÃO PARA PONTE H GIRAR PARA O SENTIDO ANT-HORARIO
+void Descer_Ponte_H(uint8_t PWM2)
+{
+	OFF_Ponte_ANT_H;
+	ON_Ponte_H;
+	OCR1B = PWM2;
+}
+
+//FUNÇÃO PARA PONTE PARAR DE GIRAR
+void Stop_Ponte_H()
+{
+	OFF_Ponte_ANT_H;
+	OFF_Ponte_H;
+}
+
+//FUNCÃO PARA INTERRUPÇÃO EMERGENCIA
+ISR(INT1_vect){
+	
+	while((Emergencia == 0)||(Resetado == 0)){                                                                //ROTINA DE QUANDO A EMERGENCIA ESTIVER ACIONADA
+		
+		Resetado = 0;
+		Status_Sist_Racao = 0;
+		Stop_Ponte_H();
+		_delay_ms(50);
+		OFF_Motor_Alimetador;
+		_delay_ms(50);
+		ON_Led_Reset;
+		ON_Led_OK;
+		
+		
+		if ((Reset == 1)&&(Emergencia == 1)){
+			OFF_Led_OK;
+			OFF_Led_Reset;
+			_delay_ms(10);
+			Resetado = 1;
+		}
+	}
+	
+}
+
+//FUNÇÃO PARA INTERRUPÇÃO TIMER 0 --- CONTROLE PID
+ISR(TIMER0_COMPA_vect){
+
+	if((Ativar_Controle == 1)||(Ativar_Controle == 3)){
+	
+		if(Ativar_Controle == 1){
+			refe = Referencia_Medida;
+		}
+		if(Ativar_Controle == 3){
+			refe = Referencia_Despejo;
+		}
+		
+		Leitura_Potenciometro = Analog_Read(1);
+		Posicao_Atual = Conversao_ohm_mm(Leitura_Potenciometro);
+	
+		erro = refe - Posicao_Atual;
+		u = ((P*u_ant) + (KC*erro) - (aKc*erro_ant));
+		erro_ant = erro;
+		u_ant = u;
+	
+		if((9<=Posicao_Atual)&&(Posicao_Atual<=70)){
+		
+		if(erro >= 0){
+			if(u >= 255){                                                                                     //SE O PWM SATURAR, ESSA CONDIÇÃO IRÁ CONTER O VALOR E SATURAR EM 255
+				u = 254;
+			}
+		}
+		
+		if(erro <= -1){
+			if(u <= -255){                                                                                    //SE O PWM SATURAR, ESSA CONDIÇÃO IRÁ CONTER O VALOR E SATURAR EM -255
+				u = -254;
+			}
+		}
+		
+		if(u>1){                                                                                              //SE O ERRO FOR MAIOR QUE ZERO, ESSA FUNÇÃO IRÁ FAZER DESCER A BOIA
+			PWM = u;
+			if(PWM<119){                                                                                      //SE O PWM ESTIVER NA ZONA MORTA, IREMOS ZERAR O PWM E FAZER O STOP DA PONTE H, ATÉ QUE O CONTROLADOR AUMENTE O PWM
+				PWM=0;
+				Stop_Ponte_H();
+			}
+			Descer_Ponte_H(PWM);
+		}
+		
+		if(u<-1){                                                                                             //SE O ERRO FOR MENOR QUE ZERO, ESSA FUNÇÃO IRÁ FAZER SUBIR A BOIA
+			PWM = ((-1)*u);
+			if(PWM<119){                                                                                      //SE O PWM ESTIVER NA ZONA MORTA, IREMOS ZERAR O PWM E FAZER O STOP DA PONTE H, ATÉ QUE O CONTROLADOR AUMENTE O PWM
+				PWM=0;     
+				Stop_Ponte_H();
+			}
+			Subir_Ponte_H(PWM);
+		}
+		
+		} else {
+		Stop_Ponte_H();
+		}
+		
+	if(erro == 0){
+		Stop_Ponte_H();
+		if(Ativar_Controle == 1){
+			Ativar_Controle = 2;
+		}
+		if(Ativar_Controle == 3){
+			Ativar_Controle = 0;
+		}
+	}
+  }
+}
+
+
+int main(void)
+{
+	  //CONFIGURAÇÃO COMUNICAÇÕA SERAIL
+	  UCSR0B|=(1<<TXEN0)|(1<<RXEN0);                                                                          //HABITA TX E RX
+	  UBRR0 = 103;											                                                  //9600 PATA 16MHz
+
+	  //ADC REGISTER
+	  ADMUX  |= (1<<REFS0);                                                                                   //DEFINE A REFERENCIA PARA VCC
+	  ADCSRA |= (1<<ADEN);                                                                                    //HABILITA CONVERSOR AD
+	  ADCSRA |= (1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0);                                                             //CONFIGURA PRESCALER PARA 128 (CONSIDERANDO UM CRISTAL DE 16 Mhz)
+	  
+	  //I/O RESGITER
+	  PORTD |= (1 << PORTD3) | (1 << PORTD4) | (1 << PORTD5) | (1 << PORTD6) | (1 << PORTD7);                 //HABILITAR PULL UP NOS BOTÕES
+	  DDRB  |= (1 << PORTB0) | (1 << PORTB1) | (1 << PORTB2) | (1 << PORTB3) | (1 << PORTB4)| (1 << PORTB5);  //DEFININDO AS SAÍDAS
+	  
+	  
+	  //PWM FAST TIMER 1
+	  TCCR1A |= (1 << COM1B1);                                                                                //DEFININDO SAÍDA COMO NÃO INVERTIDA
+	  TCCR1B |= (1<<CS12);                                                                                    //DEFININDO A FREQ DO PWM, 256 DEFINIR O TOP E DPS O PRESCALER --- 16000000/256 = 62,5 kHz
+	  TCCR1A |= (1 << WGM10) | (1 << WGM11);                                                                  //DEFININDO MODO PWM FAST
+	  TCCR1B |= (1 << WGM12) | (1 << WGM13);                                                                  //DEFININDO MODO PWM FAST
+	  OCR1A  = 255;                                                                                           //MÁXIMO
+	  
+	  //INTERRUPÇÃO INT 1 - EMERGENCIA
+	  EICRA |= (1<<ISC11)|(1<<ISC10);                                                                         //INT1/PD3 COMO BORDA DE SUBIDA
+	  EIMSK |= (1<<INT1);                                                                                     //HABILITA INT0 E INT1
+	  
+	  
+	  //INTERRUPÇÃO TIMER 0
+	  TCCR0A |= (1 << WGM01);                                                                                 //TIMER1 CONFIGURADO NO MODO CTC COM TOP EM OCR1A
+	  TCCR0B |= (1 << CS02) | (1 << CS00);                                                                    //PRESCALER DEFINIDO EM 1024
+	  TIMSK0 |= (1<<OCIE0A);                                                                                  //HABILITA INTERRUPÇÃO DE COMPARAÇÃO COM OCR1A
+	  OCR0A  |= 78;                                                                                           //OCR0A = ((TEMPO * F_CPU)/PRESCALER) = 78
+	  sei();                                                                                                  //HABILITA INTERRUPÇÃO GLOBAL
+	    
+	  //INICIALIZAR
+	  OFF_Motor_Alimetador;
+	  OFF_Ponte_ANT_H;
+	  OFF_Ponte_H;
+	  OFF_Led_Reset;
+	  OFF_Led_OK;
+	      
+	while (1) 
+    {
+		Referencia_Medida = 25;
+		Referencia_Despejo = 50;
+		
+		
+		if (Reset == 1){
+			Ativar_Controle = 1;
+		}
+		
+		if(Ativar_Controle == 2){	
+			if((S_Capacitivo == 0)||(FC_Rancao == 0)){
+					ON_Motor_Alimetador;
+					_delay_ms(50);
+					}else{
+					_delay_ms(50);
+					OFF_Motor_Alimetador;
+					Ativar_Controle = 3;
+					}
+				}
+				
+				
+		sprintf(out_str,"Posicao_Atual = %d\r\n",Posicao_Atual);
+		uart_string(out_str);
+		_delay_ms(500);
+		sprintf(out_str,"U = %f\r\n",u);
+		uart_string(out_str);
+		_delay_ms(500);
+		sprintf(out_str,"Erro = %f\r\n",erro);
+		uart_string(out_str);
+		_delay_ms(500);
+		sprintf(out_str,"PWM = %d\r\n",PWM);
+		uart_string(out_str);
+		_delay_ms(500);	
+	}
+}
